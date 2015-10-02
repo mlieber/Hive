@@ -1,0 +1,339 @@
+
+use db; 
+set mapred.job.queue.name=devqueue;  
+-- set hive.metastore.warehouse.dir=/dev/warehouse;
+-- set hive.cli.print.header=true;
+-- set hive.exec.scratchdir=/home//hivescratch
+--  set hive.exec.parallel=true;
+use ${hiveconf:SCHEMANAME} ;
+
+
+-- Ingest Opportunity
+-- member2, lower priority, could be overriden later by member
+
+INSERT OVERWRITE TABLE Full_opportunity
+select
+-- "If the combination of CM ID, Vendor ID and Location ID does not match existing record, then generate Opportunity ID and create new record.
+-- Or If Vendor Stage = ""Spend Fulfilled"" for all the records that match source record's CM ID, Vendor ID and Location ID, then generate
+-- Opportunity ID and create new record."
+ COALESCE(opp.opportunity_id, reflect("java.util.UUID", "randomUUID")) as opportunity_id,
+COALESCE(n2.vendor_id, opp.vendor_id) as vendor_id,
+COALESCE(n2.location_id, opp.location_id) as location_id,
+COALESCE(n2.cm_id, opp.cm_id) as cm_id,
+COALESCE(n2.final_spend, opp.potential_annual_spend) as potential_annual_spend,
+IF ( n2.final_spend is not null and opp.frequency is not null AND opp.average_transaction_size is null ,
+   CASE opp.frequency WHEN 'ANNUAL'  THEN n2.final_spend / 1
+                  WHEN 'SEMI-ANNUAL' then n2.final_spend / 2
+                  WHEN 'QUARTERLY' THEN n2.final_spend / 4
+                  WHEN 'BI-MONTHLY' THEN n2.final_spend / 6
+                  WHEN 'MONTHLY' THEN n2.final_spend / 12
+                  WHEN 'BI-WEEKLY' THEN n2.final_spend /  26
+                  WHEN 'WEEKLY' THEN n2.final_spend /  52
+                  WHEN 'DAILY' THEN n2.final_spend /  365 END,
+     opp.average_transaction_size) as average_transaction_size,
+opp.frequency as frequency,
+opp.outstanding_invoice  as outstanding_invoice,
+opp.urgent_flag as urgent_flag,
+IF (n2.final_spend is not null and CAST(n2.final_spend as DECIMAL) > 250000 AND n2.endorsement_id is not null , 'Yes', 'No') as top_vendor_flag,
+opp.cm_specific_acceptance as cm_specific_acceptance,
+-- depends on GMS
+opp.referral_submission_status as referral_submission_status,
+COALESCE(opp.source_type, 'AP File') as source_type,
+opp.B2B_or_B2C_Transaction as B2B_or_B2C_transaction,
+-- Lead hub updated this field when 1) the combination of CM ID, Vendor ID and Location ID matches existing record, and
+-- 2) Source Type of existing record is "AP file", and 3) Vendor Stage of existing record is NOT "Spend Fulfilled".
+COALESCE(n2.ap_file_id, opp.ap_file_id) as ap_file_id,
+--COALESCE(n2.person_id, opp.contact_person) as contact_person,
+opp.contact_person as contact_person,
+opp.comment as comment
+FROM
+( select
+n.vendor_id, n.location_id, n.cm_id, inc.final_spend as final_spend, 
+  endor.endorsement_id as endorsement_id, inc.ap_file_id,
+ pers.person_id as person_id
+from
+member2_valid_records inc
+-- there should always be a match, so no OUTER JOIN
+JOIN
+(select o.cm_id, v.record_id, v.vendor_id, v.location_id from sat_rim v
+join card_member_id_no_dups o
+on v.record_id = o.record_id) n
+ON inc.record_id = n.record_id
+LEFT OUTER JOIN vendor_contact_person pers
+ON
+-- commenting out for now, as the new field on Member doesnt exist so cannot test
+-- pers.email_address = inc.vendor_contact_person_email and
+ inc.vendor_contact_name = TRIM(CONCAT(pers.first_name, CONCAT(' ',pers.last_name)))
+-- for checking if this vendor has an endorsement that exists, for 'top vendor flag'
+LEFT OUTER JOIN
+Endorsement endor
+on (n.vendor_id = endor.vendor_id and n.location_id = endor.location_id and n.cm_id = endor.cm_id)
+) n2
+FULL OUTER JOIN
+full_opportunity opp
+on n2.cm_id = opp.cm_id and n2.vendor_id = opp.vendor_id and n2.location_id = opp.location_id
+LEFT OUTER JOIN
+vendor_info_link vil
+on opp.opportunity_id = vil.opportunity_id
+WHERE vil.vendor_stage is null OR (vil.vendor_stage is not null AND vil.vendor_stage <> 'SPEND FULFILLED')
+-- the WHERE above will discard previous records that satisfy this condition, therefore preserve them below
+UNION ALL
+select opp2.* 
+from full_opportunity opp2
+JOIN
+vendor_info_link vil2
+on opp2.opportunity_id = vil2.opportunity_id
+WHERE vil2.vendor_stage is not null and vil2.vendor_stage = 'SPEND FULFILLED' 
+;
+
+
+-- inserting a new row if stage = 'spend fulfilled', even if there is a matching/existing opportunity id
+INSERT INTO TABLE Full_opportunity
+select
+-- "If the combination of CM ID, Vendor ID and Location ID does not match existing record, then generate Opportunity ID and create new record.
+-- Or If Vendor Stage = ""Spend Fulfilled"" for all the records that match source record's CM ID, Vendor ID and Location ID, then generate
+-- Opportunity ID and create new record."
+reflect("java.util.UUID", "randomUUID") as opportunity_id,
+COALESCE(n2.vendor_id, opp.vendor_id) as vendor_id,
+COALESCE(n2.location_id, opp.location_id) as location_id,
+COALESCE(n2.cm_id, opp.cm_id) as cm_id,
+IF (vil.vendor_stage is not null AND vil.vendor_stage <> 'SPEND FULFILLED', COALESCE(n2.final_spend, opp.potential_annual_spend), opp.potential_annual_spend) as potential_annual_spend,
+IF ( n2.final_spend is not null and opp.frequency is not null AND opp.average_transaction_size is null AND (vil.vendor_stage is not null AND vil.vendor_stage <> 'SPEND FULFILLED'),
+   CASE opp.frequency WHEN 'ANNUAL'  THEN n2.final_spend / 1
+                  WHEN 'SEMI-ANNUAL' then n2.final_spend / 2
+                  WHEN 'QUARTERLY' THEN n2.final_spend / 4
+                  WHEN 'BI-MONTHLY' THEN n2.final_spend / 6
+                  WHEN 'MONTHLY' THEN n2.final_spend / 12
+                  WHEN 'BI-WEEKLY' THEN n2.final_spend /  26
+                  WHEN 'WEEKLY' THEN n2.final_spend /  52
+                  WHEN 'DAILY' THEN n2.final_spend /  365 END,
+     opp.average_transaction_size) as average_transaction_size,
+opp.frequency as frequency,
+opp.outstanding_invoice  as outstanding_invoice,
+opp.urgent_flag as urgent_flag,
+IF (n2.final_spend is not null and CAST(n2.final_spend as DECIMAL) > 250000 AND n2.endorsement_id is not null AND (vil.vendor_stage is NOT null AND vil.vendor_stage <> 'SPEND FULFILLED'), '
+Yes', 'No') as top_vendor_flag,
+opp.cm_specific_acceptance as cm_specific_acceptance,
+-- depends on GMS
+opp.referral_submission_status as referral_submission_status,
+IF (vil.vendor_stage is not null AND vil.vendor_stage <> 'SPEND FULFILLED', 'AP File', opp.source_type) as source_type,
+opp.B2B_or_B2C_Transaction as B2B_or_B2C_transaction,
+-- Lead hub updated this field when 1) the combination of CM ID, Vendor ID and Location ID matches existing record, and
+-- 2) Source Type of existing record is "AP file", and 3) Vendor Stage of existing record is NOT "Spend Fulfilled".
+IF (vil.vendor_stage is NOT null AND vil.vendor_stage <> 'Spend Fulfilled', n2.ap_file_id, opp.ap_file_id) as ap_file_id,
+--COALESCE(n2.person_id, opp.contact_person) as contact_person,
+opp.contact_person as contact_person,
+opp.comment as comment
+FROM
+( select
+n.vendor_id, n.location_id, n.cm_id, inc.final_spend as final_spend, 
+  endor.endorsement_id as endorsement_id, inc.ap_file_id,
+ pers.person_id as person_id
+from
+member2_valid_records inc
+-- there should always be a match, so no OUTER JOIN
+JOIN
+(select o.cm_id, v.record_id, v.vendor_id, v.location_id from sat_rim v
+join card_member_id_no_dups o
+on v.record_id = o.record_id) n
+ON inc.record_id = n.record_id
+LEFT OUTER JOIN vendor_contact_person pers
+ON
+-- commenting out for now, as the new field on Member doesnt exist so cannot test
+-- pers.email_address = inc.vendor_contact_person_email and
+ inc.vendor_contact_name = TRIM(CONCAT(pers.first_name, CONCAT(' ',pers.last_name)))
+-- for checking if this vendor has an endorsement that exists, for 'top vendor flag'
+LEFT OUTER JOIN
+Endorsement endor
+on (n.vendor_id = endor.vendor_id and n.location_id = endor.location_id and n.cm_id = endor.cm_id)
+) n2
+FULL OUTER JOIN
+full_opportunity opp
+on n2.cm_id = opp.cm_id and n2.vendor_id = opp.vendor_id and n2.location_id = opp.location_id
+-- we only want the ones that match, to check
+ JOIN
+vendor_info_link vil
+on opp.opportunity_id = vil.opportunity_id
+WHERE vil.vendor_stage is not null AND vil.vendor_stage = 'SPEND FULFILLED' ;
+
+
+-- Member last , as it has more weight
+-- than Member_other
+insert overwrite table full_opportunity
+select
+-- "If the combination of CM ID, Vendor ID and Location ID does not match existing record, then generate Opportunity ID and create new record.
+-- Or If Vendor Stage = ""Spend Fulfilled"" for all the records that match source record's CM ID, Vendor ID and Location ID, then generate
+-- Opportunity ID and create new record."
+-- testing if vendor stage is null, and if so, do run the first statement, to avoid an odd behavior in Hive where it goes to else stateement
+--IF (vil.vendor_stage is not null AND vil.vendor_stage <> 'SPEND FULFILLED', COALESCE(opp.opportunity_id, reflect("java.util.UUID", "randomUUID")),
+--    opp.opportunity_id) as opportunity_id,
+COALESCE(opp.opportunity_id, reflect("java.util.UUID", "randomUUID")) as opportunity_id,
+COALESCE( n2.vendor_id, opp.vendor_id) as vendor_id,
+COALESCE( n2.location_id, opp.location_id) as location_id,
+COALESCE(n2.cm_id, opp.cm_id) as cm_id,
+COALESCE(n2.pot_annual_spend, opp.potential_annual_spend) as potential_annual_spend,
+-- Lead hub updated this field when 1) the combination of CM ID, Vendor ID and Location ID matches existing record
+-- and 2) value of existing record is null and 3) Vendor Stage of existing record is NOT "Spend Fulfilled".
+-- For Average Transaction Size, if a non blank value is recieved from Member,  then store Member value.
+-- Otherwise, lead hub will calculate this field when annual spend and frequency are not blank.
+
+COALESCE(n2.avg_trans_sz, 
+    IF (n2.pot_annual_spend is not null and n2.freq is not null AND opp.average_transaction_size is null,
+   CASE n2.freq WHEN 'ANNUAL'  THEN n2.pot_annual_spend / 1
+                  WHEN 'SEMI-ANNUAL' then n2.pot_annual_spend / 2
+                  WHEN 'QUARTERLY' THEN n2.pot_annual_spend / 4
+                  WHEN 'BI-MONTHLY' THEN n2.pot_annual_spend / 6
+                  WHEN 'MONTHLY' THEN n2.pot_annual_spend / 12
+                  WHEN 'BI-WEEKLY' THEN n2.pot_annual_spend /  26
+                  WHEN 'WEEKLY' THEN n2.pot_annual_spend /  52
+                  WHEN 'DAILY' THEN n2.pot_annual_spend /  365 END,
+     opp.average_transaction_size)) as average_transaction_size,
+COALESCE(n2.freq,  opp.frequency) AS Frequency,
+COALESCE(n2.outstanding_invoice, opp.outstanding_invoice)  as outstanding_invoice,
+COALESCE(n2.urgent_lead, opp.urgent_flag) as urgent_flag,
+
+  IF (n2.pot_annual_spend is not null and CAST(n2.pot_annual_spend as DECIMAL) > 250000 AND n2.endorsement_id is not null, 'YES', 'NO') as top_vendor_flag,
+-- If data source is Member, then Lead hub updated this field when 1) the combination of CM ID, Vendor ID and Location ID matches existing record
+--  and 2) Vendor Stage of existing record is NOT "Spend Fulfilled".
+-- Lead hub calculates this field based on Stage of Vendor Info record from Member. If Stage is "Not Accepting", then mark this field as "No"
+-- if Stage is "Suppressing", then mark this field as "Yes", othewise, leave this field blank.
+  CASE n2.stage WHEN 'NOT ACCEPTING' THEN 'NO'
+                  WHEN 'SUPPRESSING' THEN 'YES'
+                  ELSE opp.cm_specific_acceptance END  as cm_specific_acceptance,
+-- depends on GMS, will be populated from there.
+opp.referral_submission_status as referral_submission_status,
+ 'One-off' as source_type,
+-- Waiting for this field in the Member feed ..not there yet
+-- should be IF (vil.vendor_stage is null OR vil.vendor_stage <> 'Spend Fulfilled', COALESCE(open.B2B_or_B2C_Transaction, opp.B2B_or_B2C_Transaction)
+'' AS B2B_or_B2C_Transaction,
+-- This will be fed from member2 process
+ opp.ap_file_id as ap_file_id,
+COALESCE(n2.person_id, opp.contact_person) as contact_person,
+COALESCE(n2.comments_and_notes, opp.comment) as comment
+FROM
+( select
+n.vendor_id, n.location_id, n.cm_id, open.pot_annual_spend as pot_annual_spend,
+open.stage as stage, open.comments_and_notes as comments_and_notes,
+open.urgent_lead as urgent_lead, open.outstanding_invoice as outstanding_invoice,
+open.freq as freq,  endor.endorsement_id as endorsement_id,
+open.avg_trans_sz as avg_trans_sz, person.person_id as person_id
+from
+member_valid_records open
+-- there should always be a match, so no OUTER JOIN
+JOIN
+-- the join should be on vendor, but no vendor id there, so using sat rim instead.
+(select o.cm_id, v.record_id, v.vendor_id, v.location_id from sat_rim v
+join card_member_id_no_dups o
+on v.record_id = o.record_id ) n
+ON open.record_id = n.record_id
+LEFT OUTER JOIN vendor_contact_person person
+ON
+-- commenting out for now, as the new field on member doesnt exist so cannot test
+-- person.email_address = open.vendor_contact_person_email and
+ open.vendor_contact = TRIM(CONCAT(person.first_name, CONCAT(' ', person.last_name)))
+-- for checking if this vendor has an endorsement that exists, for 'top vendor flag'
+LEFT OUTER JOIN
+Endorsement endor
+on (n.vendor_id = endor.vendor_id and n.location_id = endor.location_id and n.cm_id = endor.cm_id)
+) n2
+FULL OUTER JOIN
+Full_opportunity opp
+on n2.cm_id = opp.cm_id and n2.vendor_id = opp.vendor_id and n2.location_id = opp.location_id
+LEFT OUTER JOIN
+vendor_info_link vil
+on opp.opportunity_id = vil.opportunity_id
+WHERE vil.vendor_stage is null OR (vil.vendor_stage is not null AND vil.vendor_stage <> 'SPEND FULFILLED')
+-- the WHERE above will discard previous records that satisfy this condition, therefore preserve them below
+UNION ALL
+select opp2.* from full_opportunity opp2
+JOIN
+vendor_info_link vil2
+on opp2.opportunity_id = vil2.opportunity_id
+WHERE vil2.vendor_stage is not null and vil2.vendor_stage = 'SPEND FULFILLED' ;
+; 
+---
+
+-- RULE: Insert new record even if there is a match in full opportunity, if stage = 'spend fulfilled'
+insert into table full_opportunity
+select
+-- "If the combination of CM ID, Vendor ID and Location ID does not match existing record, then generate Opportunity ID and create new record.
+-- Or If Vendor Stage = ""Spend Fulfilled"" for all the records that match source record's CM ID, Vendor ID and Location ID, then generate
+-- Opportunity ID and create new record."
+-- testing if vendor stage is null, and if so, do run the first statement, to avoid an odd behavior in Hive where it goes to else stateement
+ reflect("java.util.UUID", "randomUUID") as opportunity_id,
+COALESCE( n2.vendor_id, opp.vendor_id) as vendor_id,
+COALESCE( n2.location_id, opp.location_id) as location_id,
+COALESCE(n2.cm_id, opp.cm_id) as cm_id,
+COALESCE(n2.pot_annual_spend, opp.potential_annual_spend) as potential_annual_spend,
+-- Lead hub updated this field when 1) the combination of CM ID, Vendor ID and Location ID matches existing record
+-- and 2) value of existing record is null and 3) Vendor Stage of existing record is NOT "Spend Fulfilled".
+-- For Average Transaction Size, if a non blank value is recieved from Member,  then store Member value.
+-- Otherwise, lead hub will calculate this field when annual spend and frequency are not blank.
+
+COALESCE(n2.avg_trans_sz, 
+    IF (n2.pot_annual_spend is not null and n2.freq is not null AND opp.average_transaction_size is null,
+   CASE n2.freq WHEN 'ANNUAL'  THEN n2.pot_annual_spend / 1
+                  WHEN 'SEMI-ANNUAL' then n2.pot_annual_spend / 2
+                  WHEN 'QUARTERLY' THEN n2.pot_annual_spend / 4
+                  WHEN 'BI-MONTHLY' THEN n2.pot_annual_spend / 6
+                  WHEN 'MONTHLY' THEN n2.pot_annual_spend / 12
+                  WHEN 'BI-WEEKLY' THEN n2.pot_annual_spend /  26
+                  WHEN 'WEEKLY' THEN n2.pot_annual_spend /  52
+                  WHEN 'DAILY' THEN n2.pot_annual_spend /  365 END,
+     opp.average_transaction_size)) as average_transaction_size,
+COALESCE(n2.freq,  opp.frequency) AS Frequency,
+COALESCE(n2.outstanding_invoice, opp.outstanding_invoice)  as outstanding_invoice,
+COALESCE(n2.urgent_lead, opp.urgent_flag) as urgent_flag,
+
+  IF (n2.pot_annual_spend is not null and CAST(n2.pot_annual_spend as DECIMAL) > 250000 AND n2.endorsement_id is not null, 'YES', 'NO') as top_vendor_flag,
+-- If data source is Member, then Lead hub updated this field when 1) the combination of CM ID, Vendor ID and Location ID matches existing record
+--  and 2) Vendor Stage of existing record is NOT "Spend Fulfilled".
+-- Lead hub calculates this field based on Stage of Vendor Info record from Member. If Stage is "Not Accepting", then mark this field as "No"
+-- if Stage is "Suppressing", then mark this field as "Yes", othewise, leave this field blank.
+  CASE n2.stage WHEN 'NOT ACCEPTING' THEN 'NO'
+                  WHEN 'SUPPRESSING' THEN 'YES'
+                  ELSE opp.cm_specific_acceptance END  as cm_specific_acceptance,
+-- depends on GMS, will be populated from there.
+opp.referral_submission_status as referral_submission_status,
+ ' One-off' as source_type,
+-- Waiting for this field in the member feed ..not there yet
+-- should be IF (vil.vendor_stage is null OR vil.vendor_stage <> 'Spend Fulfilled', COALESCE(open.B2B_or_B2C_Transaction, opp.B2B_or_B2C_Transaction)
+'' AS B2B_or_B2C_Transaction,
+-- This will be fed from Member2 process
+ opp.ap_file_id as ap_file_id,
+COALESCE(n2.person_id, opp.contact_person) as contact_person,
+COALESCE(n2.comments_and_notes, opp.comment) as comment
+FROM
+( select
+n.vendor_id, n.location_id, n.cm_id, open.pot_annual_spend as pot_annual_spend,
+open.stage as stage, open.comments_and_notes as comments_and_notes,
+open.urgent_lead as urgent_lead, open.outstanding_invoice as outstanding_invoice,
+open.freq as freq,  endor.endorsement_id as endorsement_id,
+open.avg_trans_sz as avg_trans_sz, person.person_id as person_id
+from
+member_valid_records open
+-- there should always be a match, so no OUTER JOIN
+JOIN
+-- the join should be on vendor, but no vendor id there, so using sat rim instead.
+(select o.cm_id, v.record_id, v.vendor_id, v.location_id from sat_rim v
+join card_member_id_no_dups o
+on v.record_id = o.record_id ) n
+ON open.record_id = n.record_id
+LEFT OUTER JOIN vendor_contact_person person
+ON
+-- commenting out for now, as the new field on member doesnt exist so cannot test
+-- person.email_address = open.vendor_contact_person_email and
+ open.vendor_contact = TRIM(CONCAT(person.first_name, CONCAT(' ', person.last_name)))
+-- for checking if this vendor has an endorsement that exists, for 'top vendor flag'
+LEFT OUTER JOIN
+Endorsement endor
+on (n.vendor_id = endor.vendor_id and n.location_id = endor.location_id and n.cm_id = endor.cm_id)
+) n2
+FULL OUTER JOIN
+Full_opportunity opp
+on n2.cm_id = opp.cm_id and n2.vendor_id = opp.vendor_id and n2.location_id = opp.location_id
+JOIN
+vendor_info_link vil
+on opp.opportunity_id = vil.opportunity_id
+WHERE vil.vendor_stage is not null and vil.vendor_stage = 'SPEND FULFILLED' ;​
+
