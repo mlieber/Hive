@@ -37,11 +37,15 @@ especially the use of the **Row number** function:
 
 >     opp.average_transaction_size) as average_transaction_size,
 
->opp.frequency as frequency,
+>  opp.frequency as frequency,
 
 >opp.outstanding_invoice  as outstanding_invoice,
+
 >opp.urgent_flag as urgent_flag,
->IF (n2.final_spend is not null and CAST(n2.final_spend as DECIMAL) > 250000 AND n2.endorsement_id is not null , 'Yes', 'No') as >top_vendor_flag,
+
+>IF (n2.final_spend is not null and CAST(n2.final_spend as DECIMAL) > 250000 AND n2.endorsement_id is not null , 'Yes', 'No') as 
+>top_vendor_flag,
+
 >opp.cm_specific_acceptance as cm_specific_acceptance,
 
 
