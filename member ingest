@@ -1,0 +1,595 @@
+-- use mydb; 
+set mapred.job.queue.name=devqueue;  
+set hive.metastore.warehouse.dir=/dev/warehouse;
+set hive.cli.print.header=true;
+set hive.exec.scratchdir=/home/hivescratch
+set hive.exec.parallel=true;
+use ${hiveconf:SCHEMANAME}  ;
+
+
+-- Ingest Member
+-- (select na.vendor_info_id, na.cus.id, na.record_id, na.stage, na.cm_nm, na.open_cm_nm, na.alter_co_nm, na.contact_method_pref, na.phone, na.email, na.shipping_addr
+-- from ${hiveconf:SCHEMANAME}.member na where na.cus_id is not null ) n
+
+-- First find wheter we have dups account_id in historical
+drop table dup_account_ids;
+Create table dup_account_ids (
+Record_id STRING,
+account_id STRING,
+count int
+)
+ ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+ESCAPED BY '\n'
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+TBLPROPERTIES ('serialization.null.format' = '')
+;
+
+insert overwrite table dup_account_ids
+select op.record_id, op.account_id, count(op.account_id) 
+from openforce_valid_records op
+join
+full_card_member fcm
+on op.account_id = fcm.account_id
+group by op.record_id, op.account_id 
+having count(op.account_id) > 1
+;
+
+-- Then send them as an extract
+INSERT OVERWRITE LOCAL DIRECTORY '${hiveconf:EXTRACTOPENFORCEBADRECORDS}'
+SELECT *
+from member_valid_records o
+join dup_account_ids  d
+where o.record_id = d.record_id;
+
+-- Then get rid of them, using <stagingName>2 tables for processing.
+insert overwrite table member2
+select op.* 
+from member_valid_records op 
+left outer join dup_account_ids dup
+ ON op.record_id = dup.record_id
+WHERE dup.record_id IS NULL;
+
+
+-- Then process - if dup account_id's in incremental, process in order found.
+
+-- Find rows that are common across historical card members and open force staging
+
+-- Lets only take 1 unique record for each account_id when there are multiple, we only need one .
+-- we take whichever. 
+insert into table card_member_id_no_dups
+select T.cm_id, T.customer_id, T.record_id, T.account_id 
+from
+(
+select 
+ row_number() over (partition by n.account_id order by n.record_id) as RANK,
+-- hash(n.account_id) AS CM_ID,
+  reflect("java.util.UUID", "randomUUID") AS cm_id,
+  n.cus_id AS customer_id,
+  n.record_id AS record_id,
+  n.account_id as account_id
+from openforce_augmented2 n
+) T
+where T.rank = 1
+;
+
+
+-- Now that we saved cm_id w/ record_id, lets process
+-- card member is just the incremebtal file.
+
+insert overwrite table card_member
+select DISTINCT cmi.account_id, cmi.cm_id, cmi.customer_id, 
+--COALESCE(n.vendor_info_id, f.OPEN_Opportunity) AS OPEN_Opportunity,
+-- COALESCE(n.stage, f.Opportunity_Stage) AS Opportunity_Stage,
+COALESCE(n.cm_nm, f.CM_Legal_Name) AS CM_Legal_Name,
+COALESCE(f.Company_Name, n.co_nm) AS Company_Name,
+COALESCE(n.alter_co_nm, f.Alternative_Company_Name) AS Alternative_company_name,
+--COALESCE(n.contact_method_pref, f.Preferred_Contact_Channel) AS Preferred_Contact_Channel,
+--COALESCE(n.phone, f.Primary_Phone) AS Primary_Phone,
+--COALESCE(n.email, f.Primary_Email) AS Primary_Email,
+f.Portofolio_Year,
+--COALESCE(n.shipping_addr, f.Shipping_address) AS Shipping_address
+IF (f.account_id is null, 'No', 'Yes') as Active_Flag
+from card_member_id_no_dups cmi
+join
+member2 n
+on cmi.record_id = n.record_id
+left outer join
+full_card_member f
+on cmi.account_id = f.account_id ;
+
+-- this is the historical file. Never gets deleted.
+insert overwrite table full_card_member 
+select DISTINCT 
+COALESCE(cmi.account_id, f.account_id),
+COALESCE(cmi.cm_id, f.cm_id),
+COALESCE(f.customer_id, cmi.customer_id),
+--COALESCE(n.vendor_info_id, f.OPEN_Opportunity) AS OPEN_Opportunity,
+--COALESCE(n.stage, f.Opportunity_Stage) AS Opportunity_Stage,
+COALESCE(n.cm_nm, f.CM_Legal_Name) AS CM_Legal_Name,
+COALESCE(f.Company_Name, n.co_nm) AS Company_Name,
+COALESCE(n.alter_co_nm, f.Alternative_Company_Name) AS Alternative_company_name,
+--COALESCE(n.contact_method_pref, f.Preferred_Contact_Channel) AS Preferred_Contact_Channel,
+--COALESCE(n.phone, f.Primary_Phone) AS Primary_Phone,
+--COALESCE(n.email, f.Primary_Email) AS Primary_Email,
+f.Portofolio_Year,
+--COALESCE(n.shipping_addr, f.Shipping_address) AS Shipping_address
+IF (f.account_id is null, 'No', 'Yes') as Active_Flag
+from card_member_id_no_dups cmi
+join
+openforce_augmented2 n
+on cmi.record_id = n.record_id
+full outer join
+full_card_member f
+on cmi.account_id = f.account_id 
+;
+
+-- lets save all of the record id / cm id records
+-- for member encountered.
+--insert into table Card_Member_id
+--select *
+--from card_member_id_no_dups
+--union all
+--select
+--  reflect("java.util.UUID", "randomUUID") AS cm_id,
+--  n.cus_id AS customer_id,
+-- n.record_id AS record_id,
+-- n.account_id as account_id
+--from openforce_augmented2 n
+--where n.record_id not in
+--( select record_id from card_member_id_no_dups)
+--
+
+
+-- Now Member2 file
+-- First find wheter we have dups customer_id in historical
+drop table dup_customer_ids;
+Create table dup_customer_ids (
+Record_id STRING,
+customer_id STRING,
+count INT
+)
+ ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\001'
+ESCAPED BY '\n'
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+TBLPROPERTIES ('serialization.null.format' = '')
+;
+
+-- we do 2 things at once here, finding the records we dont need.
+-- the Union all should take care of getting distinct rows between the 2 rules
+-- if not, does not matter anyway, we will join with this table later to get rid of these ids
+-- in the file we are processing ( member_augmented2 ) 
+-- This is only taking care of rules where customer id is not null .
+insert overwrite table dup_customer_ids
+select  T.* from 
+-- Rule:  If customer id within incremental file matches multiple customer_ids in historical, Throw exception, don’t process row
+(select op.record_id, op.customer_id, count(op.customer_id)
+from member2_valid_records op
+join
+full_card_member fcm
+on op.customer_id = fcm.customer_id
+group by op.record_id, op.customer_id 
+having count(op.customer_id) > 1
+UNION ALL
+-- Rule: If no match w customer_id, then send an exception for that record, don’t process.
+select op.record_id, op.customer_id, 1
+from member2_valid_records op
+left outer join
+full_card_member fcm
+on op.customer_id = fcm.customer_id
+where fcm.customer_id is null and op.customer_id is not null )T;
+
+--group by op.record_id, op.customer_id
+--having count(op.customer_id) =0 ) T
+
+
+-- Then send them as an extract
+INSERT OVERWRITE LOCAL DIRECTORY '${hiveconf:EXTRACTINCUBITBADRECORDS}' 
+SELECT *
+from member2_valid_records o
+join dup_customer_ids  d
+where o.record_id = d.record_id;
+
+
+-- Then get rid of them
+insert overwrite table member2_augmented2
+select op.*
+from member2_valid_records op
+left outer join dup_customer_ids dup
+ ON op.record_id = dup.record_id
+WHERE dup.record_id IS NULL;
+
+
+-- Insert into our log of ids.
+-- We add a 'I-' to the cm id to know its an incubit record.
+-- There could be some card_member_id records from member in there 
+-- with a matching customer_id, but doesnt matter: here we insert all the new records_ids from incubit.
+-- we will merge the common customer ids after this.
+
+-- Find rows and remove those that have the same customer Id - we ll just take 1
+insert into table card_member_id_no_dups
+select T.cm_id, T.customer_id, T.record_id, T.account_id
+from
+(
+select
+ row_number() over (partition by n.customer_id order by n.record_id) as RANK,
+
+-- hash(n.account_id) AS CM_ID,
+  concat('I-',reflect("java.util.UUID", "randomUUID")) AS cm_id,
+  n.customer_id AS customer_id,
+  n.record_id AS record_id,
+  '' as account_id
+from member2_augmented2 n
+where n.customer_id is not null
+) T
+where T.rank = 1
+;
+
+--insert into table card_member_id
+--select
+-- concat('I',hash(n.customer_id)) AS CM_ID,
+--  n.customer_id AS customer_id,
+-- n.record_id AS record_id,
+-- null as account_id
+--from member2_augmented2 n
+--where n.customer_id is not null;
+
+-- to remedy a bug!
+drop table card_member_temp;
+create table IF NOT EXISTS card_member_temp (
+account_Id STRING,
+cm_id STRING,
+customer_id STRING,
+cm_legal_name STRING,
+company_name STRING,
+alternative_company_name STRING,
+portofolio_year STRING,
+active_flag STRING
+)
+ ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\001'
+ESCAPED BY '\n'
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+TBLPROPERTIES ('serialization.null.format' = '')
+;
+
+-- Now that we saved cm_id w/ record_id, lets process
+-- We first find the records which have a non null customerid in incubit (cmi2),
+-- then get their cm_id, find the net new records to be added (T) , 
+-- then merge with card_member .
+insert into table card_member_temp
+select 
+COALESCE(T.account_id, cm.account_id),
+COALESCE(T.cm_id, cm.cm_id),
+COALESCE(T.customer_id, cm.customer_id),
+COALESCE(T.cm_legal_name, cm.cm_legal_name),
+COALESCE(T.company_name, cm.company_name),
+COALESCE(T.alternative_company_name, cm.alternative_company_name),
+COALESCE(T.portofolio_year, cm.portofolio_year),
+COALESCE(T.active_flag, cm.active_flag)
+from
+(select DISTINCT 
+f.account_id as account_id, cmi2.cm_id, cmi2.customer_id,
+--f.OPEN_opportunity as open_opportunity,
+--f.opportunity_stage as opportunity_stage,
+f.cm_legal_name as CM_legal_name,
+COALESCE(f.company_name, cmi2.customer_name) as company_name,
+f.alternative_company_name as alternative_company_name,
+--f.preferred_contact_channel as preferred_contact_channel,
+--f.primary_phone as primary_phone,
+-- IF (f.primary_email is null, cmi2.customer_email, f.Primary_Email) AS Primary_Email,
+--f.primary_email as primary_email,
+
+f.portofolio_year,
+--f.shipping_address
+f.active_flag as Active_Flag
+ from 
+(select DISTINCT  cmi.cm_id, cmi.customer_id, n.customer_name, n.customer_email
+from card_member_id_no_dups cmi
+join
+member2_augmented2 n
+on cmi.record_id = n.record_id
+where cmi.account_id is null and cmi.customer_id is not null
+) cmi2
+left outer join
+full_card_member f
+on cmi2.customer_id = f.customer_id 
+) T
+full outer join card_member cm
+on T.cm_id = cm.cm_id ; 
+
+-- to remedy the bug ..
+insert overwrite table card_member
+select * from card_member_temp;
+
+
+
+-- to remedy a bug!
+drop table full_card_member_temp;
+create table IF NOT EXISTS full_card_member_temp (
+account_Id STRING,
+cm_id STRING,
+customer_id STRING,
+cm_legal_name STRING,
+company_name STRING,
+alternative_company_name STRING,
+portofolio_year STRING,
+active_flag STRING
+)
+ ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\001'
+ESCAPED BY '\n'
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+TBLPROPERTIES ('serialization.null.format' = '')
+;
+
+
+-- Now we merge the incubit records with non null customer_Id with existing 
+-- Historical card member records. For this we only look at the card_member_id records
+-- that pertain to incubit (i.e. have a null account_id) whose customer_id is not null
+insert overwrite table full_card_member_temp
+select DISTINCT
+f.account_id as account_id, 
+COALESCE(cmi2.cm_id, f.cm_id),
+COALESCE(cmi2.customer_id, f.customer_id),
+--f.OPEN_opportunity as open_opportunity,
+--f.opportunity_stage as opportunity_stage,
+f.cm_legal_name as cm_legal_name,
+COALESCE(f.company_name, cmi2.customer_name) as company_name,
+f.alternative_company_name as alternative_company_name,
+--f.preferred_contact_channel as preferred_contact_channel,
+--f.primary_phone as primary_phone,
+--IF (f.primary_email is null, cmi2.customer_email, f.Primary_Email) AS Primary_Email,
+--f.primary_email as primary_email,
+
+f.portofolio_year,
+--f.shipping_address
+f.active_flag as Active_Flag
+ from
+(select DISTINCT  cmi.cm_id, cmi.customer_id, n.customer_name, n.customer_email
+from card_member_id_no_dups cmi
+join
+member_augmented2 n
+on cmi.record_id = n.record_id
+where cmi.account_id is null and cmi.customer_id is not null
+) cmi2
+full outer join
+full_card_member f
+on cmi2.customer_id = f.customer_id ;
+
+-- to remedy a bug ..
+insert overwrite table full_card_member
+select * from full_card_member_temp
+;
+
+-- Look at customer ids that are blank now -
+--- Now test for incubit's company names
+
+-- First find wheter we have dups customer_id in historical
+drop table dup_company_names;
+Create table dup_company_names (
+Record_id STRING,
+company_name STRING,
+count INT
+)
+ ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\001'
+ESCAPED BY '\n'
+LINES TERMINATED BY '\n' 
+STORED AS TEXTFILE
+TBLPROPERTIES ('serialization.null.format' = '')
+;
+
+-- Now testing for customer_id is null.
+--   If customer name  matches against multiple customer_names in historical, throw exception, don’t process
+insert overwrite table dup_company_names
+select op.record_id, op.customer_name, count(op.customer_name)
+from incubit_augmented2 op
+join
+full_card_member fcm
+on op.customer_name = fcm.company_name
+where op.customer_id is null
+group by op.record_id, op.customer_name
+having count(op.customer_name) > 1;
+
+
+-- Then send them as an extract
+INSERT OVERWRITE LOCAL DIRECTORY '${hiveconf:EXTRACTINCUBITBADRECORDSCOMPANYNAME}'
+SELECT *
+from member2_augmented2 o
+join dup_company_names  d
+where o.record_id = d.record_id;
+
+
+-- Then get rid of them, and retain the ones that only have customer id null, to work on that set.
+insert overwrite table incubit_augmented2
+select op.*
+from member2_augmented2 op
+where op.record_id not in 
+(select record_id from dup_company_names)
+;
+
+
+-- Send in extract of records that dont have a customer id in historical
+INSERT OVERWRITE LOCAL DIRECTORY '${hiveconf:EXTRACTINCUBITBADRECORDSCUSTOMERIDNULL}'
+select op2.* from ( select op.*
+from member2_augmented2 op
+where op.customer_id is null) op2
+left outer join full_card_member fcm
+on op2.customer_name = fcm.company_name
+where fcm.customer_id is  null ;
+
+-- Also get rid of records 
+-- for incubit records that dont have a customer name in historical
+-- and send as extract
+-- Rule:  If customer name doesn’t exist in historical file, then send an exception for that record, don’t process.
+
+drop table no_company_names;
+Create table no_company_names (
+Record_id STRING
+)
+ ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\001'
+ESCAPED BY '\n'
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+TBLPROPERTIES ('serialization.null.format' = '')
+;
+
+insert into table no_company_names
+select op.record_id
+from member2_augmented2 op
+where op.customer_name not in 
+(select company_name from full_card_member)
+;
+
+insert overwrite table member2_augmented2
+select op2.* 
+from
+member2_augmented2 op2
+where op2.record_id
+not in
+(
+select op.record_id
+from no_company_names op
+);
+
+-- Process - find customer id that matches name 
+
+-- Find rows that are common across historical card members and member2 staging, first on customer id
+-- Find rows and remove those that have the same customer name - we ll just take 1
+insert into table card_member_id_no_dups
+select T.cm_id, T.customer_id, T.record_id, T.account_id
+from
+(
+select
+ row_number() over (partition by n.customer_name order by n.record_id) as RANK,
+  concat('I-',reflect("java.util.UUID", "randomUUID")) AS cm_id,
+  n.customer_id AS customer_id,
+  n.record_id AS record_id,
+  '' as account_id
+from member2_augmented2 n
+where n.customer_id is null and n.customer_name is not null
+) T
+where T.rank = 1
+;
+
+
+-- lets save all of the record id / cm id records
+-- for member encountered.
+insert overwrite table Card_Member_id
+select *
+from card_member_id_no_dups
+union all
+select
+  reflect("java.util.UUID", "randomUUID") AS cm_id,
+  n.cus_id AS customer_id,
+ n.record_id AS record_id,
+ n.account_id as account_id
+from member_valid_records n
+where n.record_id not in
+( select record_id from card_member_id_no_dups)
+union all
+select
+  reflect("java.util.UUID", "randomUUID") AS cm_id,
+  n2.customer_id AS customer_id,
+ n2.record_id AS record_id,
+ '' as account_id
+from member2_valid_records n2
+where n2.record_id not in
+( select record_id from card_member_id_no_dups)
+;
+
+
+-- Now that we saved cm_id w/ record_id, lets process
+-- We first find the records which have a null customerid in member2 (cmi2),
+-- then get their cm_id, find the net new records to be added (T) ,
+-- then merge with card_member on company name
+insert overwrite table card_member_temp
+select 
+COALESCE(T.account_id, cm.account_id),
+COALESCE(T.cm_id, cm.cm_id),
+COALESCE(T.customer_id, cm.customer_id),
+COALESCE(T.cm_legal_name, cm.cm_legal_name),
+COALESCE(T.company_name, cm.company_name),
+COALESCE(T.alternative_company_name, cm.alternative_company_name),
+COALESCE(T.portofolio_year, cm.portofolio_year),
+COALESCE(T.active_flag, cm.active_flag)
+from
+(select DISTINCT
+f.account_id as account_id, cmi2.cm_id, cmi2.customer_id,
+--f.OPEN_opportunity as open_opportunity,
+--f.opportunity_stage as opportunity_stage,
+f.cm_legal_name as CM_legal_name,
+COALESCE( cmi2.customer_name, f.company_name) as company_name,
+f.alternative_company_name as alternative_company_name,
+--f.preferred_contact_channel as preferred_contact_channel,
+--f.primary_phone as primary_phone,
+-- IF (f.primary_email is null, cmi2.customer_email, f.Primary_Email) AS Primary_Email,
+--f.primary_email as primary_email,
+
+f.portofolio_year,
+--f.shipping_address
+f.active_flag as Active_Flag
+ from
+(select DISTINCT  cmi.cm_id, cmi.customer_id, n.customer_name, n.customer_email
+from card_member_id_no_dups cmi
+join
+member2 n
+on cmi.record_id = n.record_id
+where cmi.account_id is null and cmi.customer_id is null
+) cmi2
+left outer join
+full_card_member f
+on cmi2.customer_name = f.company_name
+) T
+full outer join card_member cm
+on T.cm_id = cm.cm_id ;
+
+-- to remedy the bug ..
+insert overwrite table card_member
+select * from card_member_temp;
+
+-- Now we merge the member2 records with non null customer_Id with existing
+-- Historical card member records. For this we only look at the card_member_id records
+-- that pertain to member2 (i.e. have a null account_id) whose customer_id is null this time
+insert overwrite table full_card_member_temp
+select DISTINCT
+f.account_id as account_id,
+COALESCE(cmi2.cm_id, f.cm_id),
+COALESCE(cmi2.customer_id, f.customer_id),
+--f.OPEN_opportunity as open_opportunity,
+--f.opportunity_stage as opportunity_stage,
+f.cm_legal_name as cm_legal_name,
+COALESCE(cmi2.customer_name, f.company_name) as company_name,
+f.alternative_company_name as alternative_company_name,
+--f.preferred_contact_channel as preferred_contact_channel,
+--f.primary_phone as primary_phone,
+--IF (f.primary_email is null, cmi2.customer_email, f.Primary_Email) AS Primary_Email,
+--f.primary_email as primary_email,
+
+f.portofolio_year,
+--f.shipping_address
+f.active_flag as Active_Flag
+ from
+(select DISTINCT  cmi.cm_id, cmi.customer_id, n.customer_name, n.customer_email
+from card_member_id_no_dups cmi
+join
+member2 n
+on cmi.record_id = n.record_id
+where cmi.account_id is null and cmi.customer_id is null
+) cmi2
+full outer join
+full_card_member f
+on cmi2.cm_id = f.cm_id ;
+
+-- to remedy a bug ..
+insert overwrite table full_card_member
+select * from full_card_member_temp
+;
+
